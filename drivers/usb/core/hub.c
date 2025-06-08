@@ -119,7 +119,9 @@ static int usb_reset_and_verify_device(struct usb_device *udev);
 static int hub_port_disable(struct usb_hub *hub, int port1, int set_state);
 static bool hub_port_warm_reset_required(struct usb_hub *hub, int port1,
 		u16 portstatus);
-
+#ifdef CONFIG_USB_INTERFACE_LPM_LIST
+static void hub_set_initial_usb2_lpm_policy(struct usb_device *udev);
+#endif
 static inline char *portspeed(struct usb_hub *hub, int portstatus)
 {
 	if (hub_is_superspeedplus(hub->hdev))
@@ -973,7 +975,11 @@ static int hub_set_port_link_state(struct usb_hub *hub, int port1,
  */
 static void hub_port_logical_disconnect(struct usb_hub *hub, int port1)
 {
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+	dev_info(&hub->ports[port1 - 1]->dev, "logical disconnect\n");
+#else
 	dev_dbg(&hub->ports[port1 - 1]->dev, "logical disconnect\n");
+#endif
 	hub_port_disable(hub, port1, 1);
 
 	/* FIXME let caller ask to power down the port:
@@ -1733,6 +1739,9 @@ static void hub_disconnect(struct usb_interface *intf)
 	struct usb_device *hdev = interface_to_usbdev(intf);
 	int port1;
 
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+	pr_info("%s\n", __func__);
+#endif
 	/*
 	 * Stop adding new hub events. We do not want to block here and thus
 	 * will not try to remove any pending work item.
@@ -2244,6 +2253,9 @@ void usb_disconnect(struct usb_device **pdev)
 	 */
 	dev_dbg(&udev->dev, "unregistering device\n");
 	usb_disable_device(udev, 0);
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+	dev_info(&udev->dev, "usb disable device end\n");
+#endif
 	usb_hcd_synchronize_unlinks(udev);
 
 	if (udev->parent) {
@@ -2454,6 +2466,12 @@ static int usb_enumerate_device(struct usb_device *udev)
 	}
 
 	usb_detect_interface_quirks(udev);
+#ifdef CONFIG_USB_INTERFACE_LPM_LIST
+	if (usb_detect_interface_lpm(udev)) {
+		dev_info(&udev->dev, "L1 enable");
+		hub_set_initial_usb2_lpm_policy(udev);
+	}
+#endif
 
 	return 0;
 }
@@ -4898,6 +4916,12 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 				retval = hub_set_address(udev, devnum);
 				if (retval >= 0)
 					break;
+#if defined(CONFIG_USB_HOST_SAMSUNG_FEATURE)
+				if (udev->reset_resume && retval < 0) {
+					dev_err(&udev->dev, "set address fail in reset resume\n");
+					break;
+				}
+#endif
 				msleep(200);
 			}
 			if (retval < 0) {
@@ -5029,14 +5053,21 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 			usb_set_lpm_parameters(udev);
 		}
 	}
-
+#ifdef CONFIG_USB_INTERFACE_LPM_LIST
+	dev_info(&udev->dev, "udev->lpm_capable=%d\n", udev->lpm_capable);
+#endif
 	retval = 0;
 	/* notify HCD that we have a device connected and addressed */
 	if (hcd->driver->update_device)
 		hcd->driver->update_device(hcd, udev);
+#ifndef CONFIG_USB_INTERFACE_LPM_LIST
 	hub_set_initial_usb2_lpm_policy(udev);
+#endif
 fail:
 	if (retval) {
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+		dev_err(&udev->dev, "%s fail. retval=%d\n", __func__, retval);
+#endif
 		hub_port_disable(hub, port1, 0);
 		update_devnum(udev, devnum);	/* for disconnect processing */
 	}
@@ -5216,6 +5247,10 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 	struct usb_device *udev = port_dev->child;
 	static int unreliable_port = -1;
 	bool retry_locked;
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+	pr_info("%s\n", __func__);
+#endif
+
 
 	/* Disconnect any existing devices under this port */
 	if (udev) {
@@ -5276,6 +5311,11 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 		usb_lock_port(port_dev);
 		mutex_lock(hcd->address0_mutex);
 		retry_locked = true;
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+		dev_info(&port_dev->dev,
+			"%s : before usb_alloc_dev() port %d, status %04x, change %04x, %s\n",
+			__func__, port1, portstatus, portchange, portspeed(hub, portstatus));
+#endif
 		/* reallocate for each attempt, since references
 		 * to the previous one can escape in various ways
 		 */
@@ -5287,7 +5327,11 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 			usb_unlock_port(port_dev);
 			goto done;
 		}
-
+#ifdef CONFIG_USB_DEBUG_DETAILED_LOG
+		dev_info(&port_dev->dev,
+			"%s : after usb_alloc_dev() port %d, status %04x, change %04x, %s\n",
+			__func__, port1, portstatus, portchange, portspeed(hub, portstatus));
+#endif
 		usb_set_device_state(udev, USB_STATE_POWERED);
 		udev->bus_mA = hub->mA_per_port;
 		udev->level = hdev->level + 1;
@@ -5967,6 +6011,12 @@ static int usb_reset_and_verify_device(struct usb_device *udev)
 		ret = hub_port_init(parent_hub, udev, port1, i, &descriptor);
 		if (ret >= 0 || ret == -ENOTCONN || ret == -ENODEV)
 			break;
+#if defined(CONFIG_USB_HOST_SAMSUNG_FEATURE)
+		if (ret < 0 && udev->reset_resume == 1) {
+			dev_err(&udev->dev, "hub_port_init fail in reset resume\n");
+			break;
+		}
+#endif
 	}
 	mutex_unlock(hcd->address0_mutex);
 
